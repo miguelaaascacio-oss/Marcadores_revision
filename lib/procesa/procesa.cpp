@@ -1,5 +1,3 @@
-  #include <onnxruntime_cxx_api.h>
-  #include <opencv2/dnn.hpp> //necesario para dnn filtro de los candidatos similares
   #include "procesa/procesa.h"
   #include <algorithm>   // std::max, std::min
   #include <array>       // std::array
@@ -14,12 +12,6 @@
     float MatrixRt[16];     //Matriz de rotación y traslación
   };
   
-Ort::Session& yolo_session() {
-    static Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "yolo");
-    static Ort::Session s(env, "../best.onnx", Ort::SessionOptions{});
-    return s;
-}
-
   list<Caracteristicas> lista_caracteristicas;
   list<Caracteristicas> lista_caracteristicas_leida;
 
@@ -60,101 +52,11 @@ Ort::Session& yolo_session() {
       
       return num_mark;
   }
-
-  // --- YOLO ---
   
-  //sesión de ONNX Runtime con el modelo ya cargado, imagen de la cámara 640x480, en formato BGR opencv
+  //Prueba unicamente puntos YOLO sin validacion connectedComponentsWithStats ni recorte
+    bool search_marker_in_box(Mat& IMG1, Mat& IMG, const std::array<int, 4>& caja, uint8_t um, int tiempo) {
 
-  std::vector<YoloBBox> inferirYOLO(cv::Mat& frame, Ort::Session& session) {
-    cv::Mat IMG_yolo;
-    cv::resize(frame, IMG_yolo, cv::Size(640, 640)); //rediimensionamos a 640x640 (estandar yolo)
-    cv::Mat rgb;
-    cv::cvtColor(IMG_yolo, rgb, cv::COLOR_BGR2RGB);
-    rgb.convertTo(rgb, CV_32F, 1.0f / 255.0f); //normalizamos 
-
-// ------------- conversion de HWC a CHW ----------------------
-    
-    //OpenCV guarda la imagen entrelazada (HWC): los tres canales de cada píxel van juntos.
-    //HWC (OpenCV):  R0 G0 B0 | R1 G1 B1 | R2 G2 B2 |
-    
-    //El modelo espera planar (CHW): primero todos los R, luego todos los G, luego todos los B.
-    //CHW (ONNX):    R0 R1 R2 ... | G0 G1 G2 ... | B0 B1 B2
-
-    std::vector<cv::Mat> ch(3);
-    cv::split(rgb, ch); //separamos la imagen en 3 canales RGB 
-    std::vector<float> input_data(3 * 640 * 640); 
-    
-    // Aplanamiento de canales
-    // R desde el elemento 0, G desde el elemento 409,600, B desde el elemento 819,200 total 1,228,800 floats
-    for (int c = 0; c < 3; c++)
-        memcpy(input_data.data() + c * 640 * 640, ch[c].data, 640 * 640 * sizeof(float));
-
-    std::array<int64_t, 4> shape = {1, 3, 640, 640}; //tensor de entrada 1 imagen 3 canales 640x640
-    auto mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault); //aqui viven los datos 
-    
-    //se crea tensor de entrada contiene:
-    //mem, el puntero a los datos, el número total de elementos, el puntero a la forma y cuántas dimensiones tiene
-    auto tensor = Ort::Value::CreateTensor<float>(mem, input_data.data(), input_data.size(), shape.data(), shape.size());
-
-    const char* input_names[]  = {"images"}; //Los nombres de las capas de entrada y salida de ONNX
-    const char* output_names[] = {"output0"};//Los nombres de las capas de entrada y salida de ONNX
-    
-    auto outputs = session.Run(Ort::RunOptions{nullptr}, input_names, &tensor, 1, output_names, 1); //se realiza inferencia
-
-    float* data = outputs[0].GetTensorMutableData<float>(); //Puntero al inicio del buffer de la salida
-    int num_det = outputs[0].GetTensorTypeAndShapeInfo().GetShape()[1]; //informacion vector [imagen, detecciones, salidas]
-    // data: [ cx0 cy0 w0 h0 conf0 clase0 | cx1 cy1 w1 h1 conf1 clase1 | solo hay una clase, un marcador
-
-    std::vector<YoloBBox> candidatos;
-    for (int i = 0; i < num_det; i++) {
-        float conf = data[i * 6 + 4];
-        if (conf < 0.9f) continue;
-        float cx = data[i * 6 + 0], cy = data[i * 6 + 1], w = data[i * 6 + 2], h = data[i * 6 + 3];
-        
-        // como la salida en un vetor plano encontramos las componentes de esta manera
-	//índice:  0   1   2   3   4     5      6   7   8   9   10    11    ...
-	//data: [ a   b   c   d  conf  clase | a   b   c   d  conf  clase | ... ]
-	//	└──────── fila 0 ────────┘ └──────── fila 1 ────────┘
-        
-        
-        //calculamos el bounding box recortando si se sale de los limites y reescalando el boundingbox de 
-        // una imagen de 640 x 640 a 640 x 480
-
-        const float sx = frame.cols / 640.0f;   // 640x480 -> 1.0
-        const float sy = frame.rows / 640.0f;   // 640x480 -> 0.75
-        
-        YoloBBox box;
-        box.x1 = std::max(0.0f,   cx - (w * 1.2f) / 2) * sx;
-	box.y1 = std::max(0.0f,   cy - (h * 1.2f) / 2) * sy;
-	box.x2 = std::min(640.0f, cx + (w * 1.2f) / 2) * sx;
-	box.y2 = std::min(640.0f, cy + (h * 1.2f) / 2) * sy;
-        box.confidence = conf;
-        box.valid = true;
-        candidatos.push_back(box);
-    }
-    
-    
-    //return candidatos; //candidatos = [ box1, box2, ... ] que pasaron el umbral no tiene NMS                           (Non-Maximum Suppression y manda muchas cajas identicas usamos el de opencn dnn <opencv2/dnn.hpp>
-    std::vector<cv::Rect> rects;
-    std::vector<float> scores;
-    
-    for (const auto& c : candidatos) {
-        rects.emplace_back(cv::Point(cvRound(c.x1), cvRound(c.y1)),
-                       cv::Point(cvRound(c.x2), cvRound(c.y2)));
-        scores.push_back(c.confidence);
-    }
-
-    std::vector<int> idx;
-    cv::dnn::NMSBoxes(rects, scores, 0.9f , 0.5f, idx); // idx = posicion de candidato que sobreviven al NMS
-
-    std::vector<YoloBBox> keep;
-    for (int i : idx) keep.push_back(candidatos[i]);
-        return keep;                 // aqui estan los candidatos no repetidos
-   }
-  
-
-  bool search_marker_in_frame(Mat& IMG1, Mat& IMG, uint8_t um, int tiempo, const std::vector<YoloBBox>& candidatos) {
-
+    Mat Image;
     float points[12];
     int num_comp[2]; //number for compare
     int marker_box[4]; //Se agrega para el seguimiento
@@ -163,81 +65,75 @@ Ort::Session& yolo_session() {
     bool marker_found = false;
     uchar *pout;
     int *pin;
+    
+    Mat Etiquetas, Estadisticas, Centroides;
     String s;
     
-    Mat Image2 = Mat::zeros(480, 640, CV_8UC1);      
-    const Rect imgRect(0, 0, IMG.cols, IMG.rows);
-    
-    for (const YoloBBox& cb : candidatos) {     //Debemos iterar en la lista de candidatos obtenida en obtener_homografia
-    //cada candidatos es un ROI
+    // ---- ROI de esta caja  ----
+    Rect roi(Point(caja[0], caja[1]), Point(caja[2], caja[3]));
+        
+    if (roi.width < 10 || roi.height < 10) return false; // se descartan roi muy pequenos, basura
 
-        // ---- ROI de esta caja usamos cvFloor/cvCeil para redondear hacia afuera ----
-        Rect roi(Point(cvFloor(cb.x1), cvFloor(cb.y1)),                 
-                 Point(cvCeil(cb.x2),  cvCeil(cb.y2)));
-                 
-        roi &= imgRect; //Intersecta el ROI con los límites de la imagen.
-        
-        if (roi.width < 10 || roi.height < 10) continue; // se descartan roi muy pequenos, basura
-        const int x0 = roi.x, y0 = roi.y; //desplazamiento ROI -> imagen debemos guardar x0 y0 para saber posicon del recorte
+    GaussianBlur(IMG(roi), Image, Size(7, 7), 0, 0);  // Smooth filter
+    threshold(Image, Image, um, 255, THRESH_BINARY);
+      
+    Image = ~Image;
 
-        // ---- Umbral LOCAL (Otsu) solo dentro del ROI ----
-        // Otsu calcula automáticamente un umbral para cada ROI (ayuda con sombras); opcional, se puede usar umbral fijo (um)
-        Mat Image, Etiquetas, Estadisticas, Centroides;
-        GaussianBlur(IMG(roi), Image, Size(7, 7), 0, 0);
-        threshold(Image, Image, 0, 255, THRESH_BINARY | THRESH_OTSU);
-        
-        Image = ~Image;
-        
-        /** Los objetos deben ser blancos **/
-        int n = connectedComponentsWithStats(Image, Etiquetas, Estadisticas,
+    Mat Image2 = Mat::zeros(Image.rows, Image.cols, CV_8UC1); //mascara de aislamiento del tamano del roi
+    int n = connectedComponentsWithStats(Image, Etiquetas, Estadisticas,
                                         Centroides, 8, CV_32S);
-        //printf( "n = %d\n", n );
 
-        /** Para todas las componentes conectadas **/
-        // for (int i = 1; i < n && !marker_found; i++) { //se lo quité para que
-        // busque mas marcadores
-        for (int i = 1; i < n; i++) {
+    //printf( "n = %d\n", n );
+
+    /** Para todas las componentes conectadas **/
+    // for (int i = 1; i < n && !marker_found; i++) { //se lo quité para que
+    // busque mas marcadores
     
-          // printf("Search in frame\n");
-          if (Estadisticas.at<int>(i, CC_STAT_AREA) < 50) continue;
+    for (int i = 1; i < n; i++) {
+    
+      // printf("Search in frame\n");
+      if (Estadisticas.at<int>(i, CC_STAT_AREA) < 50) continue;
 
-            v[0] = Estadisticas.at<int>(i, CC_STAT_LEFT) - 1;
-          if (v[0] < 0) v[0] = 0;
-            v[1] = Estadisticas.at<int>(i, CC_STAT_TOP) - 1;
-          if (v[1] < 0) v[1] = 0;
-            v[2] = v[0] + Estadisticas.at<int>(i, CC_STAT_WIDTH) + 1;
-          if (v[2] > Image.cols - 1) v[2] = Image.cols - 1;
-            v[3] = v[1] + Estadisticas.at<int>(i, CC_STAT_HEIGHT) + 1;
-          if (v[3] > Image.rows - 1) v[3] = Image.rows - 1;
+      v[0] = Estadisticas.at<int>(i, CC_STAT_LEFT) - 1;
+      if (v[0] < 0) v[0] = 0;
+      v[1] = Estadisticas.at<int>(i, CC_STAT_TOP) - 1;
+      if (v[1] < 0) v[1] = 0;
+      v[2] = v[0] + Estadisticas.at<int>(i, CC_STAT_WIDTH) + 1;
+      if (v[2] > Image.cols - 1) v[2] = Image.cols - 1;
+      v[3] = v[1] + Estadisticas.at<int>(i, CC_STAT_HEIGHT) + 1;
+      if (v[3] > Image.rows - 1) v[3] = Image.rows - 1;
 
-          if (v[0] == 0 || v[1] == 0 || v[2] == Image.cols - 1 ||
-            v[3] == Image.rows - 1)
-            continue;
-
-          for (int j = v[1]; j <= v[3]; j++) {
-            pin = Etiquetas.ptr<int>(j) + v[0];
-            pout = Image2.ptr<uchar>(j + y0) + v[0] + x0; // el x0 es para coordenadas imagen completa
-
-            for (int k = v[0]; k <= v[2]; k++) {
-                if (*pin == i) {
-                *pout = 255;
-                }
-                pin++;
-                pout++;
-            }
-          }
+      if (v[0] == 0 || v[1] == 0 || v[2] == Image.cols - 1 ||
+          v[3] == Image.rows - 1)
+        continue;
         
-      // v pasa a coordenadas de la imagen completa para reconoce
-      int vg[4] = { v[0] + x0, v[1] + y0, v[2] + x0, v[3] + y0 }; //seguimos guardando el tamano de la imagen no del roi 
-            
+      for (int j = v[1]; j <= v[3]; j++) {
+        pin = Etiquetas.ptr<int>(j) + v[0];
+        pout = Image2.ptr<uchar>(j) + v[0];
+
+        for (int k = v[0]; k <= v[2]; k++) {
+          if (*pin == i) {
+            *pout = 255;
+          }
+          pin++;
+          pout++;
+        }
+      }
+        
       //Cambiar el 4to parametro por 1 si la imagen ya esta invertida
       
-      if (reconoce(Image2, vg, points, num_comp, 0) == 0) {       //reconoce debe verificar cada deteccion de yolo
+      if (reconoce(Image2, v, points, num_comp, 0) == 0) {
         marker_found = true;
+        
+        // Pasar los 6 vértices a coordenadas del frame
+        for (int p = 0; p < 6; p++) {
+            points[2*p]     += roi.x;   // x
+            points[2*p + 1] -= roi.y;   // y se resta por que viene invertida
+        }
         //printf("Marcador encontrado en frame \n");
         // datos del marcador encontrado
-        marker_box[0] = Estadisticas.at<int>(i, CC_STAT_LEFT) + x0;    // x
-        marker_box[1] = Estadisticas.at<int>(i, CC_STAT_TOP) + y0;     // y
+        marker_box[0] = Estadisticas.at<int>(i, CC_STAT_LEFT) + roi.x;    // x
+        marker_box[1] = Estadisticas.at<int>(i, CC_STAT_TOP) + roi.y;     // y
         marker_box[2] = Estadisticas.at<int>(i, CC_STAT_WIDTH);   // width
         marker_box[3] = Estadisticas.at<int>(i, CC_STAT_HEIGHT);  // height
         rectangle(IMG1, Point(marker_box[0], marker_box[1]), Point((marker_box[0]+ marker_box[2]), (marker_box[1]+ marker_box[3])) ,Scalar(255, 0, 0), 2, 2);
@@ -263,27 +159,24 @@ Ort::Session& yolo_session() {
       //imshow("Original", IMG1);#include "homography/homografia.h"
 
       for (int j = v[1]; j <= v[3]; j++) {
-        pout = Image2.ptr<uchar>(j + y0) + v[0] + x0;
+        pout = Image2.ptr<uchar>(j) + v[0];
         for (int k = v[0]; k <= v[2]; k++) {
           *pout++ = 0;
         }
       }
     }
-  }
 
 
     return marker_found;
   }
-
-
+  
   /*
     Se usa para saber si existen marcadores y cuantos se econtraron.
   */
 
-  int obtener_caracteristicas(Mat& IMG1, Mat& IMG, uint8_t um, int tiempo){
-      std::vector<YoloBBox> candidatos = inferirYOLO(IMG1, yolo_session());
+  int obtener_caracteristicas(Mat& IMG1, Mat& IMG, const std::array<int, 4>& caja, uint8_t um, int tiempo){
       bool marker_found;
-      marker_found = search_marker_in_frame(IMG1, IMG, um, tiempo, candidatos);
+      marker_found = search_marker_in_box(IMG1, IMG, caja, um, tiempo);
       if (marker_found) {
           return puntosMarcador.size(); //El número de marcadores encontrados.
       } else {
@@ -658,7 +551,8 @@ void imprimir_lista(){
   //Opcionales
 
 
-  std::vector<MarcadorHomografia> obtener_homografias(Mat& IMG1, Mat& IMG, uint8_t um, Ort::Session& session, bool verbose){ 
+  std::vector<MarcadorHomografia> obtener_homografias(Mat& IMG1, Mat& IMG, const std::array<int, 4>& caja, uint8_t um, bool verbose){ 
+      //  cajas es una lista de boundingbox de YOLO
       float MatrixK[16];
       float MatrixRt[16];
       float points[12];
@@ -716,40 +610,14 @@ void imprimir_lista(){
       double vdP4[4] = {4.45098039, 4.26056068, 4.05882353, 4.34915634};
 
       
-      std::vector<YoloBBox> candidatos = inferirYOLO(IMG1, session);  //se manda a llamar YOLO
-      //cout << "YOLO cajas: " << candidatos.size() << endl; //ver las cajas encontradas arriba del umbral
-      
-      // Ver las caja de Yolo comentar todo el ciclo para ya no verlas 
-      
-      for (const auto& c : candidatos) {
-          cv::rectangle(IMG1,
-                  cv::Point(cvRound(c.x1), cvRound(c.y1)),
-                  cv::Point(cvRound(c.x2), cvRound(c.y2)),
-                  cv::Scalar(0, 0, 255), 2);                    
-
-          char txt[32];
-          snprintf(txt, sizeof(txt), "%.2f", c.confidence);
-          cv::putText(IMG1, txt,
-                cv::Point(cvRound(c.x1), std::max(15, cvRound(c.y1) - 5)),
-                cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 255), 1);
-          }
-          
-      
       std::vector<MarcadorHomografia> resultado;
       
-      if (candidatos.empty()) {
-        puntosMarcador.clear();
-        return resultado;               // sin marcador: no se llama a search_marker_in_frame
-      }
-      
-      marker_found = search_marker_in_frame(IMG1, IMG, um, 0, candidatos); //manda los candidatos de marcadores detectados
+      marker_found = search_marker_in_box(IMG1, IMG, caja, um, 0); //manda las caja de marcadores detectados
       if (marker_found) {
           state = 1;
       } else {
           state = 0;
       }
-
-      cout << "Numero de marcadores en la imagen : " << puntosMarcador.size()<< endl;
 
       for(int i=0; i<puntosMarcador.size(); i++){
 

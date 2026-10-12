@@ -29,8 +29,8 @@ Ort::Session& yolo_session();
 std::vector<YoloBBox> inferirYOLO(cv::Mat& frame, Ort::Session& session);
 // proesamiento
 int numero_marcador(int num_comp[2]);
-bool search_marker_in_frame(Mat& IMG1, Mat& IMG, uint8_t um, int tiempo, const std::vector<YoloBBox>& candidatos);
-int obtener_caracteristicas(Mat& IMG1, Mat& IMG, uint8_t um, int tiempo);
+bool search_marker_in_box(Mat& IMG1, Mat& IMG, const std::array<int, 4>& caja, uint8_t um, int tiempo);
+int obtener_caracteristicas(Mat& IMG1, Mat& IMG, const std::array<int, 4>& caja, uint8_t um, int tiempo);
 void cambia_coordenadasAumentadas(unsigned char buffer[55], int i, float coordenada);
 void cambia_DatoAumentado(unsigned char buffer[55], int i, int ancho);
 void enviar_caracteristicasTrans(int num_marcadores, int sock);
@@ -50,6 +50,6 @@ struct MarcadorHomografia {
   std::array<cv::Point2f, 6> puntos;  // los 6 puntos en el orden del modelo
 };
 
-std::vector<MarcadorHomografia> obtener_homografias(Mat& IMG1, Mat& IMG, uint8_t um,
-                                                    Ort::Session& session, bool verbose = true);
+std::vector<MarcadorHomografia> obtener_homografias(Mat& IMG1, Mat& IMG, const std::array<int, 4>& caja, 
+                                                                           uint8_t um, bool verbose = true);
 

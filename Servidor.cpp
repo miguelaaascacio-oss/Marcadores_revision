@@ -1,3 +1,5 @@
+#include <onnxruntime_cxx_api.h>
+#include <opencv2/dnn.hpp> //necesario para dnn filtro de los candidatos similares
 #include "procesa/procesa.h"
 #include "marker/reconoce.h" 
 #include <opencv2/opencv.hpp>
@@ -36,6 +38,103 @@ constexpr float IMG_H = 480.0f;
 inline cv::Point2f invertirY(const cv::Point2f& p) {
     return cv::Point2f(p.x, (IMG_H - 1.0f) - p.y);
 }
+
+Ort::Session& yolo_session() {
+    static Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "yolo");
+    static Ort::Session s(env, "../best.onnx", Ort::SessionOptions{});
+    return s;
+}
+
+// --- YOLO ---
+  
+  //sesión de ONNX Runtime con el modelo ya cargado, imagen de la cámara 640x480, en formato BGR opencv
+
+  std::vector<YoloBBox> inferirYOLO(cv::Mat& frame, Ort::Session& session) {
+    cv::Mat IMG_yolo;
+    cv::resize(frame, IMG_yolo, cv::Size(640, 640)); //rediimensionamos a 640x640 (estandar yolo)
+    cv::Mat rgb;
+    cv::cvtColor(IMG_yolo, rgb, cv::COLOR_BGR2RGB);
+    rgb.convertTo(rgb, CV_32F, 1.0f / 255.0f); //normalizamos 
+
+// ------------- conversion de HWC a CHW ----------------------
+    
+    //OpenCV guarda la imagen entrelazada (HWC): los tres canales de cada píxel van juntos.
+    //HWC (OpenCV):  R0 G0 B0 | R1 G1 B1 | R2 G2 B2 |
+    
+    //El modelo espera planar (CHW): primero todos los R, luego todos los G, luego todos los B.
+    //CHW (ONNX):    R0 R1 R2 ... | G0 G1 G2 ... | B0 B1 B2
+
+    std::vector<cv::Mat> ch(3);
+    cv::split(rgb, ch); //separamos la imagen en 3 canales RGB 
+    std::vector<float> input_data(3 * 640 * 640); 
+    
+    // Aplanamiento de canales
+    // R desde el elemento 0, G desde el elemento 409,600, B desde el elemento 819,200 total 1,228,800 floats
+    for (int c = 0; c < 3; c++)
+        memcpy(input_data.data() + c * 640 * 640, ch[c].data, 640 * 640 * sizeof(float));
+
+    std::array<int64_t, 4> shape = {1, 3, 640, 640}; //tensor de entrada 1 imagen 3 canales 640x640
+    auto mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault); //aqui viven los datos 
+    
+    //se crea tensor de entrada contiene:
+    //mem, el puntero a los datos, el número total de elementos, el puntero a la forma y cuántas dimensiones tiene
+    auto tensor = Ort::Value::CreateTensor<float>(mem, input_data.data(), input_data.size(), shape.data(), shape.size());
+
+    const char* input_names[]  = {"images"}; //Los nombres de las capas de entrada y salida de ONNX
+    const char* output_names[] = {"output0"};//Los nombres de las capas de entrada y salida de ONNX
+    
+    auto outputs = session.Run(Ort::RunOptions{nullptr}, input_names, &tensor, 1, output_names, 1); //se realiza inferencia
+
+    float* data = outputs[0].GetTensorMutableData<float>(); //Puntero al inicio del buffer de la salida
+    int num_det = outputs[0].GetTensorTypeAndShapeInfo().GetShape()[1]; //informacion vector [imagen, detecciones, salidas]
+    // data: [ cx0 cy0 w0 h0 conf0 clase0 | cx1 cy1 w1 h1 conf1 clase1 | solo hay una clase, un marcador
+
+    std::vector<YoloBBox> candidatos;
+    for (int i = 0; i < num_det; i++) {
+        float conf = data[i * 6 + 4];
+        if (conf < 0.9f) continue;
+        float cx = data[i * 6 + 0], cy = data[i * 6 + 1], w = data[i * 6 + 2], h = data[i * 6 + 3];
+        
+        // como la salida en un vetor plano encontramos las componentes de esta manera
+	//índice:  0   1   2   3   4     5      6   7   8   9   10    11    ...
+	//data: [ a   b   c   d  conf  clase | a   b   c   d  conf  clase | ... ]
+	//	└──────── fila 0 ────────┘ └──────── fila 1 ────────┘
+        
+        
+        //calculamos el bounding box recortando si se sale de los limites y reescalando el boundingbox de 
+        // una imagen de 640 x 640 a 640 x 480
+
+        const float sx = frame.cols / 640.0f;   // 640x480 -> 1.0
+        const float sy = frame.rows / 640.0f;   // 640x480 -> 0.75
+        
+        YoloBBox box;
+        box.x1 = std::max(0.0f,   cx - (w * 1.2f) / 2) * sx;
+	box.y1 = std::max(0.0f,   cy - (h * 1.2f) / 2) * sy;
+	box.x2 = std::min(640.0f, cx + (w * 1.2f) / 2) * sx;
+	box.y2 = std::min(640.0f, cy + (h * 1.2f) / 2) * sy;
+        box.confidence = conf;
+        box.valid = true;
+        candidatos.push_back(box);
+    }
+    
+    
+    //return candidatos; //candidatos = [ box1, box2, ... ] que pasaron el umbral no tiene NMS                           (Non-Maximum Suppression y manda muchas cajas identicas usamos el de opencn dnn <opencv2/dnn.hpp>
+    std::vector<cv::Rect> rects;
+    std::vector<float> scores;
+    
+    for (const auto& c : candidatos) {
+        rects.emplace_back(cv::Point(cvRound(c.x1), cvRound(c.y1)),
+                       cv::Point(cvRound(c.x2), cvRound(c.y2)));
+        scores.push_back(c.confidence);
+    }
+
+    std::vector<int> idx;
+    cv::dnn::NMSBoxes(rects, scores, 0.9f , 0.5f, idx); // idx = posicion de candidato que sobreviven al NMS
+
+    std::vector<YoloBBox> keep;
+    for (int i : idx) keep.push_back(candidatos[i]);
+        return keep;                 // aqui estan los candidatos no repetidos
+   }
 
 
 //* --------- PROYECCIÓN (2D HOMOGRAFÍA) --------- /
@@ -173,6 +272,7 @@ int main(int /*argc*/, char** /*argv*/)
     
     cv::VideoCapture cap(2);
     int frame_id = 0;
+    Ort::Session& session = yolo_session(); //inicia YOLO
     
     if (!cap.isOpened()) {
         std::cerr << "Error: Could not open the camera." << std::endl;
@@ -197,10 +297,41 @@ int main(int /*argc*/, char** /*argv*/)
         cv::cvtColor(IMG, grayFull, cv::COLOR_BGR2GRAY);
         IMG_marcas      = frame.clone();
         frameProcesado  = frame.clone();
+        cv::Mat YoloVista = IMG.clone();
 
         // ---------- Detección  ----------
-        std::vector<MarcadorHomografia> detectados =	
-        obtener_homografias(IMG_marcas, grayFull, 70, yolo_session()); 
+        // Aqui se llama a la red YOLO para detectar los marcadores
+        std::vector<YoloBBox> cajas = inferirYOLO(IMG, session);  //se manda a llamar YOLO
+         //cout << "YOLO cajas: " << candidatos.size() << endl; //ver las cajas encontradas arriba del umbral
+      
+        // Ver las caja de Yolo comentar todo el ciclo para ya no verlas 
+        for (const auto& c : cajas) {
+            cv::rectangle(YoloVista,
+                cv::Point(cvRound(c.x1), cvRound(c.y1)),
+                cv::Point(cvRound(c.x2), cvRound(c.y2)),
+                cv::Scalar(0, 0, 255), 2);                    
+
+            char txt[32];
+            snprintf(txt, sizeof(txt), "%.2f", c.confidence);
+            cv::putText(YoloVista, txt,
+                cv::Point(cvRound(c.x1), std::max(15, cvRound(c.y1) - 5)),
+                cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 255), 1);
+            }
+
+        // para cada marcador detectado se llama a homografias en su caja contenedora
+        std::vector<MarcadorHomografia> detectados;
+        
+        for (const auto& c : cajas) {
+            std::array<int, 4> caja = { static_cast<int>(c.x1), static_cast<int>(c.y1),
+                                        static_cast<int>(c.x2), static_cast<int>(c.y2) };
+                                
+            // c.x1 c.y1 y c.x2 c.y2 son las esquinas de la caja que contiene al marcador 
+            
+            std::vector<MarcadorHomografia> det =
+                obtener_homografias(IMG_marcas, grayFull, caja, 70);
+
+            detectados.insert(detectados.end(), det.begin(), det.end());
+        }
 
         
         // ---------- Construcción de DatosMarcador ----------
@@ -297,7 +428,8 @@ int main(int /*argc*/, char** /*argv*/)
         
         // ---------- Visualización ----------
         cv::imshow("Marcador Proyectado", frameProcesado);
-        cv::imshow("Deteccion", IMG_marcas);          //ver candidatos YOLO y marcadores detectados 
+        cv::imshow("Deteccion", IMG_marcas);   //Marcadores detectados de homografias
+        cv::imshow("YOLO detecciones", YoloVista);   //detecciones YOLO
 
         char key = (char)cv::waitKey(1);
         if (key == 27 || key == 'q') running = false;
