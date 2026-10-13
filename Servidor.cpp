@@ -104,14 +104,18 @@ Ort::Session& yolo_session() {
         //calculamos el bounding box recortando si se sale de los limites y reescalando el boundingbox de 
         // una imagen de 640 x 640 a 640 x 480
 
-        const float sx = frame.cols / 640.0f;   // 640x480 -> 1.0
-        const float sy = frame.rows / 640.0f;   // 640x480 -> 0.75
+        const float sy = 480.0 / 640.0f;   // 640x480 -> 0.75
         
+        float x1 = std::max(0.0f,   cx - w/2 - 5);
+        float y1 = std::max(0.0f,   cy - h/2 - 5) ;
+        float x2 = std::min(640.0f, cx + w/2 + 5);
+        float y2 = std::min(640.0f, cy + h/2 + 5);
+
         YoloBBox box;
-        box.x1 = std::max(0.0f,   cx - (w * 1.2f) / 2) * sx;
-	box.y1 = std::max(0.0f,   cy - (h * 1.2f) / 2) * sy;
-	box.x2 = std::min(640.0f, cx + (w * 1.2f) / 2) * sx;
-	box.y2 = std::min(640.0f, cy + (h * 1.2f) / 2) * sy;
+        box.x = x1;                // esquina superior izquierda
+        box.y = y1 * sy;
+        box.w = (x2 - x1);         // ancho
+        box.h = (y2 - y1) * sy;         // alto
         box.confidence = conf;
         box.valid = true;
         candidatos.push_back(box);
@@ -123,8 +127,7 @@ Ort::Session& yolo_session() {
     std::vector<float> scores;
     
     for (const auto& c : candidatos) {
-        rects.emplace_back(cv::Point(cvRound(c.x1), cvRound(c.y1)),
-                       cv::Point(cvRound(c.x2), cvRound(c.y2)));
+        rects.emplace_back(cvRound(c.x), cvRound(c.y), cvRound(c.w), cvRound(c.h));
         scores.push_back(c.confidence);
     }
 
@@ -292,29 +295,24 @@ int main(int /*argc*/, char** /*argv*/)
         }
 
         // ---------- Preprocesado ----------
-        cv::Mat IMG, IMG_marcas, grayFull, frameProcesado;
-        cv::resize(frame, IMG, cv::Size(640, 480));
-        cv::cvtColor(IMG, grayFull, cv::COLOR_BGR2GRAY);
-        IMG_marcas      = frame.clone();
-        frameProcesado  = frame.clone();
-        cv::Mat YoloVista = IMG.clone();
+        cv::Mat grayFull;
+        cv::resize(frame, frame, cv::Size(640, 480));
+        cv::cvtColor(frame, grayFull, cv::COLOR_BGR2GRAY);
 
         // ---------- Detección  ----------
         // Aqui se llama a la red YOLO para detectar los marcadores
-        std::vector<YoloBBox> cajas = inferirYOLO(IMG, session);  //se manda a llamar YOLO
+        std::vector<YoloBBox> cajas = inferirYOLO(frame, session);  //se manda a llamar YOLO
          //cout << "YOLO cajas: " << candidatos.size() << endl; //ver las cajas encontradas arriba del umbral
       
         // Ver las caja de Yolo comentar todo el ciclo para ya no verlas 
         for (const auto& c : cajas) {
-            cv::rectangle(YoloVista,
-                cv::Point(cvRound(c.x1), cvRound(c.y1)),
-                cv::Point(cvRound(c.x2), cvRound(c.y2)),
-                cv::Scalar(0, 0, 255), 2);                    
+             cv::Rect r(cvRound(c.x), cvRound(c.y), cvRound(c.w), cvRound(c.h));
+             cv::rectangle(frame, r, cv::Scalar(0, 0, 255), 2);            
 
             char txt[32];
             snprintf(txt, sizeof(txt), "%.2f", c.confidence);
-            cv::putText(YoloVista, txt,
-                cv::Point(cvRound(c.x1), std::max(15, cvRound(c.y1) - 5)),
+            cv::putText(frame, txt,
+                cv::Point(r.x, std::max(15, r.y - 5)),
                 cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 255), 1);
             }
 
@@ -322,13 +320,13 @@ int main(int /*argc*/, char** /*argv*/)
         std::vector<MarcadorHomografia> detectados;
         
         for (const auto& c : cajas) {
-            std::array<int, 4> caja = { static_cast<int>(c.x1), static_cast<int>(c.y1),
-                                        static_cast<int>(c.x2), static_cast<int>(c.y2) };
+            std::array<int, 4> caja = { static_cast<int>(c.x), static_cast<int>(c.y),
+                                        static_cast<int>(c.w), static_cast<int>(c.h) };
                                 
-            // c.x1 c.y1 y c.x2 c.y2 son las esquinas de la caja que contiene al marcador 
+            // c.x c.y c.w c.h en opencv x,y es la esquina superior izquierda y w en ancho y h el alto de la caja
             
             std::vector<MarcadorHomografia> det =
-                obtener_homografias(IMG_marcas, grayFull, caja, 70);
+                obtener_homografias(frame, grayFull, caja, 70);
 
             detectados.insert(detectados.end(), det.begin(), det.end());
         }
@@ -360,21 +358,13 @@ int main(int /*argc*/, char** /*argv*/)
             //double cy = d.C[1];
             //double cz = d.C[2];
             
-            d.norma = std::sqrt((tx * tx) + (ty * ty) + (tz * tz));
+            //d.norma = std::sqrt((tx * tx) + (ty * ty) + (tz * tz));
 
             //d.Rt = cv::Mat::eye(4, 4, CV_64F);
             //for (int r = 0; r < 3; r++) {
               //  for (int c = 0; c < 3; c++) d.Rt.at<double>(r, c) = m.R(r, c);
                 //d.Rt.at<double>(r, 3) = m.t[r];
             //}
-
-            // Mover origen de la esquina (P4) al centro del marcador
-            //cv::Mat T_local = (cv::Mat_<double>(4, 4) <<
-                               // -1,  0, 0, 5,       //21.75 para marcador grande 5 para chico
-                               // 0,  -1, 0, 5,
-                               // 0,  0, 1, 0,
-                               // 0,  0, 0, 1);
-            //d.Rt = d.Rt * T_local;
             
             marcadores_procesados.push_back(d);
         }
@@ -401,23 +391,23 @@ int main(int /*argc*/, char** /*argv*/)
             if (etiqueta_actual > 3) break; 
             mp.etiqueta = etiqueta_actual;
 
-            proyectarMarcador(frameProcesado, mp, fueraZona, EnRuta);
+            proyectarMarcador(frame, mp, fueraZona, EnRuta);
 
             // >>> POSE <<<
             // t en cm -> m
             double tx = mp.t[0];
 	    double ty = mp.t[1];
 	    double tz = mp.t[2]; 
-	    double norma = std::sqrt(tx*tx + ty*ty + tz*tz);
+	    //double norma = std::sqrt(tx*tx + ty*ty + tz*tz);
 
             // Texto AR
             int oy = (etiqueta_actual - 1) * 140;
             char buf[128];
             snprintf(buf, sizeof(buf), "E%d Profundidad: %.2f m", mp.etiqueta, -tz);
-            cv::putText(frameProcesado, buf, {30, 30 + oy},
+            cv::putText(frame, buf, {30, 30 + oy},
                         cv::FONT_HERSHEY_SIMPLEX, 0.8, {0,255,255}, 2);
             snprintf(buf, sizeof(buf), "X:%.2f Y:%.2f", tx, ty);
-            cv::putText(frameProcesado, buf, {30, 60 + oy},
+            cv::putText(frame, buf, {30, 60 + oy},
                         cv::FONT_HERSHEY_SIMPLEX, 0.6, {0,255,0}, 2);
 
             //printf("E%d -> x:%.2f y:%.2f z:%.2f | norma:%.2f\n",
@@ -427,9 +417,7 @@ int main(int /*argc*/, char** /*argv*/)
         }
         
         // ---------- Visualización ----------
-        cv::imshow("Marcador Proyectado", frameProcesado);
-        cv::imshow("Deteccion", IMG_marcas);   //Marcadores detectados de homografias
-        cv::imshow("YOLO detecciones", YoloVista);   //detecciones YOLO
+        cv::imshow("Marcador Proyectado", frame);
 
         char key = (char)cv::waitKey(1);
         if (key == 27 || key == 'q') running = false;

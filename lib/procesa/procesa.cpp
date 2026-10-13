@@ -70,11 +70,13 @@
     String s;
     
     // ---- ROI de esta caja  ----
-    Rect roi(Point(caja[0], caja[1]), Point(caja[2], caja[3]));
+    cv::Rect roi(caja[0], caja[1], caja[2], caja[3]);
         
     if (roi.width < 10 || roi.height < 10) return false; // se descartan roi muy pequenos, basura
+    
+    cv::Mat subImg = IMG(roi); 
 
-    GaussianBlur(IMG(roi), Image, Size(7, 7), 0, 0);  // Smooth filter
+    GaussianBlur(subImg, Image, Size(7, 7), 0, 0);  // Smooth filter
     threshold(Image, Image, um, 255, THRESH_BINARY);
       
     Image = ~Image;
@@ -83,10 +85,8 @@
     int n = connectedComponentsWithStats(Image, Etiquetas, Estadisticas,
                                         Centroides, 8, CV_32S);
 
-    //printf( "n = %d\n", n );
-
     /** Para todas las componentes conectadas **/
-    // for (int i = 1; i < n && !marker_found; i++) { //se lo quité para que
+    //for (int i = 1; i < n && !marker_found; i++) { //se lo quité para que
     // busque mas marcadores
     
     for (int i = 1; i < n; i++) {
@@ -157,13 +157,15 @@
       }
 
       //imshow("Original", IMG1);#include "homography/homografia.h"
-
+     
+     
       for (int j = v[1]; j <= v[3]; j++) {
         pout = Image2.ptr<uchar>(j) + v[0];
         for (int k = v[0]; k <= v[2]; k++) {
           *pout++ = 0;
         }
       }
+     
     }
 
 

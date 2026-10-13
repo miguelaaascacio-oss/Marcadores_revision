@@ -24,7 +24,7 @@ using namespace cv;
 using namespace std;
 
 // ---- YOLO ----
-struct YoloBBox { float x1, y1, x2, y2, confidence; bool valid; };
+struct YoloBBox { float x, y, w, h, confidence; bool valid; };
 Ort::Session& yolo_session();
 std::vector<YoloBBox> inferirYOLO(cv::Mat& frame, Ort::Session& session);
 // proesamiento
